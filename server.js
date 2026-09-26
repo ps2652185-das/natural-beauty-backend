@@ -27,6 +27,7 @@ function emptyDb() {
     devices: {},
     items: [],
     locks: {},
+    plates: {},
     meta: { createdAt: Date.now(), version: 3 },
   };
 }
@@ -41,6 +42,7 @@ function normalizeDb(db) {
     if (row && row.ciphertext) delete row.ciphertext;
   }
   if (!db.locks || typeof db.locks !== "object") db.locks = {};
+  if (!db.plates || typeof db.plates !== "object") db.plates = {};
   if (!db.meta || typeof db.meta !== "object") db.meta = { createdAt: Date.now() };
   return db;
 }
@@ -221,6 +223,11 @@ function touchDevice(db, key, deviceId, body, fallbackName) {
   if (!db.devices[key]) db.devices[key] = {};
   const prev = db.devices[key][deviceId] || {};
   const name = safeName(body.deviceName || body.name, fallbackName || prev.name || deviceId);
+  // plate: only overwrite when client sends plate/nameplate; keep previous otherwise
+  let plate = prev.plate || "";
+  if (body.plate != null || body.nameplate != null) {
+    plate = String(body.plate != null ? body.plate : body.nameplate).trim().slice(0, 80);
+  }
   db.devices[key][deviceId] = {
     deviceId,
     name,
@@ -230,6 +237,7 @@ function touchDevice(db, key, deviceId, body, fallbackName) {
       body.batteryPct != null && Number.isFinite(Number(body.batteryPct))
         ? Number(body.batteryPct)
         : prev.batteryPct,
+    plate,
     updatedAt: Date.now(),
   };
   return name;
@@ -512,6 +520,64 @@ app.get("/api/lock", (req, res) => {
   if (!key) return;
   const db = load();
   res.json(db.locks[key] || {});
+});
+
+/** Per-device live nameplate — Collector sets, that phone's Natural Beauty reads. */
+app.get("/api/plate", (req, res) => {
+  const key = requireVaultKey(req, res);
+  if (!key) return;
+  const deviceId = safeId(req.query.deviceId || (req.body && req.body.deviceId) || "");
+  const db = load();
+  // Prefer device-scoped plate
+  if (deviceId && db.devices[key] && db.devices[key][deviceId] && db.devices[key][deviceId].plate) {
+    const text = String(db.devices[key][deviceId].plate);
+    return res.json({ text, deviceId, updatedAt: db.devices[key][deviceId].updatedAt || 0 });
+  }
+  // Fallback: plates[key][deviceId] map or legacy global plates[key].text
+  if (!db.plates) db.plates = {};
+  const bucket = db.plates[key];
+  if (deviceId && bucket && typeof bucket === "object" && !bucket.text && bucket[deviceId]) {
+    const row = bucket[deviceId];
+    return res.json({ text: row.text || "Developer : Samar", deviceId, updatedAt: row.updatedAt || 0 });
+  }
+  if (bucket && bucket.text) {
+    return res.json({ text: String(bucket.text), deviceId: deviceId || null, updatedAt: bucket.updatedAt || 0 });
+  }
+  res.json({ text: "Developer : Samar", deviceId: deviceId || null, updatedAt: 0 });
+});
+
+app.post("/api/plate", (req, res) => {
+  const key = requireVaultKey(req, res);
+  if (!key) return;
+  const body = req.body || {};
+  const deviceId = safeId(body.deviceId);
+  let text = body.text != null ? String(body.text) : "";
+  text = text.trim().slice(0, 80);
+  if (!text) text = "Developer : Samar";
+  if (!deviceId) {
+    return res.status(400).json({ error: "deviceId required — each phone has its own plate" });
+  }
+  withDb((db) => {
+    if (!db.devices[key]) db.devices[key] = {};
+    const prev = db.devices[key][deviceId] || { deviceId, name: deviceId };
+    db.devices[key][deviceId] = {
+      ...prev,
+      deviceId,
+      plate: text,
+      updatedAt: Date.now(),
+    };
+    if (!db.plates) db.plates = {};
+    if (!db.plates[key] || typeof db.plates[key] !== "object" || db.plates[key].text) {
+      // migrate legacy single plate into map
+      const legacy = db.plates[key] && db.plates[key].text ? db.plates[key] : null;
+      db.plates[key] = {};
+      if (legacy) db.plates[key]._legacy = legacy;
+    }
+    db.plates[key][deviceId] = { text, updatedAt: Date.now() };
+    return { ok: true, text, deviceId, updatedAt: Date.now() };
+  })
+    .then((out) => res.json(out))
+    .catch((e) => res.status(500).json({ error: e.message || "save failed" }));
 });
 
 function itemFromBody(b, key, deviceId, name) {
