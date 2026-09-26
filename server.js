@@ -3,6 +3,7 @@ import cors from "cors";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import crypto from "crypto";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
@@ -11,8 +12,8 @@ const BAK_FILE = path.join(DATA_DIR, "store.bak");
 const BLOB_DIR = path.join(DATA_DIR, "blobs");
 const CHUNK_DIR = path.join(DATA_DIR, "chunks");
 const MAX_ITEMS = Number(process.env.MAX_ITEMS) || 5000;
-const MAX_JSON = process.env.MAX_JSON || "50mb";
-const MAX_CIPHER_CHARS = Number(process.env.MAX_CIPHER_CHARS) || 40_000_000;
+const MAX_JSON = process.env.MAX_JSON || "80mb";
+const MAX_CIPHER_CHARS = Number(process.env.MAX_CIPHER_CHARS) || 70_000_000;
 const MAX_ID_LEN = 128;
 const MAX_NAME_LEN = 120;
 const INLINE_CT = 8 * 1024 * 1024; // return full ciphertext if under this
@@ -35,6 +36,10 @@ function normalizeDb(db) {
   if (!db.devices || typeof db.devices !== "object") db.devices = {};
   if (!Array.isArray(db.items)) db.items = [];
   db.items = db.items.filter((x) => x && typeof x === "object" && x.id);
+  // never keep bulk ciphertext inside store.json (blobs only)
+  for (const row of db.items) {
+    if (row && row.ciphertext) delete row.ciphertext;
+  }
   if (!db.locks || typeof db.locks !== "object") db.locks = {};
   if (!db.meta || typeof db.meta !== "object") db.meta = { createdAt: Date.now() };
   return db;
@@ -57,6 +62,11 @@ function load() {
 }
 
 function save(db) {
+  if (db && Array.isArray(db.items)) {
+    for (const row of db.items) {
+      if (row && row.ciphertext) delete row.ciphertext;
+    }
+  }
   const tmp = DB_FILE + ".tmp." + process.pid;
   const payload = JSON.stringify(db);
   fs.writeFileSync(tmp, payload, { encoding: "utf8" });
@@ -71,7 +81,12 @@ function withDb(work) {
   const run = chain.then(async () => {
     const db = load();
     const result = await work(db);
-    save(db);
+    try {
+      save(db);
+    } catch (se) {
+      console.error("db save failed", se && se.message);
+      throw se;
+    }
     return result;
   });
   chain = run.catch((err) => {
@@ -80,32 +95,41 @@ function withDb(work) {
   return run;
 }
 
-function blobPath(id) {
-  return path.join(BLOB_DIR, id + ".bin");
+/** Per-vault namespace so two keys never share blob files. */
+function keyNS(key) {
+  return crypto.createHash("sha256").update(String(key || "")).digest("hex").slice(0, 16);
 }
-function chunkDir(id) {
-  return path.join(CHUNK_DIR, id);
+function blobPath(id, key) {
+  return path.join(BLOB_DIR, keyNS(key), id + ".bin");
 }
-function writeBlob(id, buf) {
-  fs.writeFileSync(blobPath(id), buf);
+function chunkDir(id, key) {
+  return path.join(CHUNK_DIR, keyNS(key), id);
 }
-function readBlob(id) {
-  const p = blobPath(id);
-  if (!fs.existsSync(p)) return null;
-  return fs.readFileSync(p);
+function writeBlob(id, buf, key) {
+  const p = blobPath(id, key);
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(p, buf);
 }
-function deleteBlob(id) {
-  try {
-    fs.unlinkSync(blobPath(id));
-  } catch {}
-  try {
-    fs.rmSync(chunkDir(id), { recursive: true, force: true });
-  } catch {}
+function readBlob(id, key) {
+  const p = blobPath(id, key);
+  if (fs.existsSync(p)) return fs.readFileSync(p);
+  // legacy flat path (pre-namespace)
+  const legacy = path.join(BLOB_DIR, id + ".bin");
+  if (fs.existsSync(legacy)) return fs.readFileSync(legacy);
+  return null;
+}
+function deleteBlob(id, key) {
+  try { fs.unlinkSync(blobPath(id, key)); } catch {}
+  try { fs.unlinkSync(path.join(BLOB_DIR, id + ".bin")); } catch {}
+  try { fs.rmSync(chunkDir(id, key), { recursive: true, force: true }); } catch {}
+  try { fs.rmSync(path.join(CHUNK_DIR, id), { recursive: true, force: true }); } catch {}
 }
 
 function packedFromJson(ivB64, ctB64) {
   const iv = Buffer.from(String(ivB64 || ""), "base64");
   const ct = Buffer.from(String(ctB64 || ""), "base64");
+  if (iv.length < 8 || iv.length > 32) throw new Error("bad iv length");
+  if (ct.length < 1) throw new Error("empty ciphertext");
   return Buffer.concat([iv, ct]);
 }
 
@@ -150,7 +174,8 @@ function safeId(v) {
   if (v == null) return null;
   const s = String(v).trim().slice(0, MAX_ID_LEN);
   if (!s) return null;
-  if (s.includes("..") || s.includes("/") || s.includes("\\")) return null;
+  if (!/^[A-Za-z0-9._-]+$/.test(s)) return null;
+  if (s === "." || s === "..") return null;
   return s;
 }
 
@@ -187,7 +212,7 @@ function pruneIfNeeded(db, key) {
     }
     if (oldestIdx < 0) break;
     const gone = db.items[oldestIdx];
-    if (gone && gone.id) deleteBlob(gone.id);
+    if (gone && gone.id) deleteBlob(gone.id, gone.userKey || key);
     db.items.splice(oldestIdx, 1);
   }
 }
@@ -211,7 +236,9 @@ function touchDevice(db, key, deviceId, body, fallbackName) {
 }
 
 function upsertItemMeta(db, row) {
-  const idx = db.items.findIndex((x) => x && x.id === row.id);
+  const idx = db.items.findIndex(
+    (x) => x && x.id === row.id && x.userKey === row.userKey
+  );
   if (idx >= 0) {
     row.createdAt = db.items[idx].createdAt || row.createdAt;
     db.items[idx] = row;
@@ -247,7 +274,27 @@ function rateLimit(req, res, next) {
 }
 
 const app = express();
-app.use(cors());
+app.set("trust proxy", 1);
+app.use(cors({ methods: ["GET", "POST", "DELETE", "OPTIONS"], allowedHeaders: ["Content-Type", "x-nb-key"] }));
+
+// Reject mutating /api calls WITHOUT parsing body (stops unauthenticated large-POST memory burn)
+app.use((req, res, next) => {
+  try {
+    if (req.method === "GET" || req.method === "HEAD" || req.method === "OPTIONS") return next();
+    const path = String(req.path || "");
+    if (!path.startsWith("/api/")) return next();
+    if (path === "/api/health") return next();
+    const raw = req.headers["x-nb-key"];
+    const s = raw != null ? String(raw).trim() : "";
+    if (s.length < 8 || s === "default") {
+      return res.status(401).json({
+        error: "x-nb-key required (min 8 chars) - private vault only",
+      });
+    }
+  } catch {}
+  next();
+});
+
 app.use(express.json({ limit: MAX_JSON }));
 app.use(rateLimit);
 
@@ -269,36 +316,95 @@ function gcPending(db) {
   const now = Date.now();
   const keep = [];
   let purged = 0;
+  const liveIds = new Set();
   for (const row of db.items) {
     if (!row) continue;
     if (row.pending && row.createdAt && now - row.createdAt > 24 * 60 * 60 * 1000) {
-      try { deleteBlob(row.id); } catch {}
+      try { deleteBlob(row.id, row.userKey); } catch {}
       purged++;
       continue;
+    }
+    if (row.id) {
+      liveIds.add(String(row.id));
+      // namespaced key: ns|id so vault A delete does not keep vault B orphan
+      liveIds.add(keyNS(row.userKey) + "|" + String(row.id));
     }
     keep.push(row);
   }
   if (purged) db.items = keep;
+  try {
+    for (const name of fs.readdirSync(BLOB_DIR)) {
+      if (name.endsWith(".bin")) {
+        const id = name.slice(0, -4);
+        if (!liveIds.has(id)) {
+          try { fs.unlinkSync(path.join(BLOB_DIR, name)); } catch {}
+          purged++;
+        }
+        continue;
+      }
+      const sub = path.join(BLOB_DIR, name);
+      try {
+        if (!fs.statSync(sub).isDirectory()) continue;
+        for (const f of fs.readdirSync(sub)) {
+          if (!f.endsWith(".bin")) continue;
+          const id = f.slice(0, -4);
+          if (!liveIds.has(name + "|" + id)) {
+            try { fs.unlinkSync(path.join(sub, f)); } catch {}
+            purged++;
+          }
+        }
+      } catch {}
+    }
+    for (const ns of fs.readdirSync(CHUNK_DIR)) {
+      const sub = path.join(CHUNK_DIR, ns);
+      try {
+        if (!fs.statSync(sub).isDirectory()) continue;
+        // legacy: CHUNK_DIR/id
+        if (liveIds.has(ns)) continue;
+        // namespaced: CHUNK_DIR/keyNS/id
+        for (const id of fs.readdirSync(sub)) {
+          if (!liveIds.has(ns + "|" + id)) {
+            try { fs.rmSync(path.join(sub, id), { recursive: true, force: true }); } catch {}
+            purged++;
+          }
+        }
+      } catch {}
+    }
+  } catch {}
   return purged;
 }
 
+function healthPayload() {
+  fs.accessSync(DATA_DIR, fs.constants.W_OK);
+  const db = load();
+  let deviceCount = 0;
+  for (const k of Object.keys(db.devices || {})) {
+    const map = db.devices[k];
+    if (map && typeof map === "object") deviceCount += Object.keys(map).length;
+  }
+  return {
+    ok: true,
+    service: "natural-beauty-backend",
+    version: 3,
+    writable: true,
+    items: db.items.length,
+    maxItems: MAX_ITEMS,
+    devices: deviceCount,
+    vaults: Object.keys(db.devices || {}).length,
+  };
+}
+
 app.get("/api/health", (_req, res) => {
-  res.redirect(307, "/health");
+  try {
+    res.json(healthPayload());
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
 });
 
 app.get("/health", (_req, res) => {
   try {
-    fs.accessSync(DATA_DIR, fs.constants.W_OK);
-    const db = load();
-    res.json({
-      ok: true,
-      service: "natural-beauty-backend",
-      version: 3,
-      writable: true,
-      items: db.items.length,
-      maxItems: MAX_ITEMS,
-      devices: Object.keys(db.devices).length,
-    });
+    res.json(healthPayload());
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e.message || e) });
   }
@@ -354,8 +460,8 @@ app.post("/api/lock", (req, res) => {
   const pinVerify = String(body.pinVerify || body.verify || "").slice(0, 128);
   const dekWrapHide = String(
     body.dekWrapHide || body.wrap || body.dekWrap || body.atlasWrap || ""
-  );
-  const dekWrapAtlas = String(body.dekWrapAtlas || body.atlasWrap || dekWrapHide || "");
+  ).slice(0, 20000);
+  const dekWrapAtlas = String(body.dekWrapAtlas || body.atlasWrap || dekWrapHide || "").slice(0, 20000);
   const atlasSalt = String(body.atlasSalt || pinSalt || "").slice(0, 128);
   const atlasVerify = String(body.atlasVerify || pinVerify || "").slice(0, 128);
 
@@ -419,11 +525,12 @@ function itemFromBody(b, key, deviceId, name) {
     filename: String(b.filename || "file").slice(0, 180),
     mime: String(b.mime || "application/octet-stream").slice(0, 120),
     byteSize: Number(b.byteSize) || 0,
-    iv: String(b.iv || ""),
+    iv: String(b.iv || "").slice(0, 128),
     alg: String(b.alg || (b.mediaType === "video" ? "chacha20-poly1305" : "aes-256-gcm")).slice(0, 40),
     chunked: false,
     totalChunks: 0,
     createdAt: Date.now(),
+    // ciphertext intentionally omitted — stored only in blob files
   };
 }
 
@@ -452,7 +559,7 @@ app.post("/api/items", (req, res) => {
     return res.status(400).json({ error: "bad base64" });
   }
   withDb((db) => {
-    const exists = db.items.some((x) => x && x.id === id);
+    const exists = db.items.some((x) => x && x.id === id && x.userKey === key);
     if (!exists && db.items.length >= MAX_ITEMS) pruneIfNeeded(db, key);
     if (!exists && db.items.length >= MAX_ITEMS) {
       const err = new Error("vault full");
@@ -460,9 +567,15 @@ app.post("/api/items", (req, res) => {
       throw err;
     }
     const name = touchDevice(db, key, deviceId, b, deviceId);
-    writeBlob(id, packed);
+    writeBlob(id, packed, key);
     const row = itemFromBody({ ...b, id }, key, deviceId, name);
-    row.byteSize = packed.length - 12;
+    let ivLen = 12;
+    try {
+      const ivBuf = Buffer.from(String(b.iv || ""), "base64");
+      if (ivBuf.length >= 8 && ivBuf.length <= 32) ivLen = ivBuf.length;
+    } catch {}
+    row.byteSize = Math.max(0, packed.length - ivLen);
+    row.ivLen = ivLen;
     upsertItemMeta(db, row);
     try { gcPending(db); } catch {}
     return { ok: true, id };
@@ -483,26 +596,32 @@ app.post("/api/items/init", (req, res) => {
   }
   const key = requireVaultKey(req, res);
   if (!key) return;
-  const totalChunks = Math.max(1, Number(b.totalChunks) || 1);
-  if (totalChunks > 20000) {
-    return res.status(400).json({ error: "too many chunks" });
+  const totalChunks = Number(b.totalChunks);
+  if (!Number.isFinite(totalChunks) || totalChunks < 1 || totalChunks > 20000) {
+    return res.status(400).json({ error: "totalChunks must be 1..20000" });
   }
   withDb((db) => {
     try { gcPending(db); } catch {}
-    const exists = db.items.some((x) => x && x.id === id);
+    const exists = db.items.some((x) => x && x.id === id && x.userKey === key);
     if (!exists && db.items.length >= MAX_ITEMS) pruneIfNeeded(db, key);
+    if (!exists && db.items.length >= MAX_ITEMS) {
+      const err = new Error("vault full");
+      err.status = 507;
+      throw err;
+    }
+    try { deleteBlob(id, key); } catch {}
     const name = touchDevice(db, key, deviceId, b, deviceId);
     const row = itemFromBody({ ...b, id }, key, deviceId, name);
     row.chunked = true;
     row.totalChunks = totalChunks;
     row.pending = true;
     upsertItemMeta(db, row);
-    fs.mkdirSync(chunkDir(id), { recursive: true });
-    fs.writeFileSync(path.join(chunkDir(id), "iv"), String(b.iv));
+    fs.mkdirSync(chunkDir(id, key), { recursive: true });
+    fs.writeFileSync(path.join(chunkDir(id, key), "iv"), String(b.iv));
     return { ok: true, id, totalChunks };
   })
     .then((out) => res.json(out))
-    .catch((e) => res.status(500).json({ error: e.message || "init failed" }));
+    .catch((e) => res.status(e.status || 500).json({ error: e.message || "init failed" }));
 });
 
 app.post("/api/items/:id/chunk", (req, res) => {
@@ -519,24 +638,37 @@ app.post("/api/items/:id/chunk", (req, res) => {
   if (data.length > 2_500_000) {
     return res.status(413).json({ error: "chunk too large" });
   }
-  // Ownership check (was missing - anyone could write chunks)
-  const db = load();
-  const row = db.items.find((x) => x && x.id === id);
-  if (!row || row.userKey !== key) {
-    return res.status(404).json({ error: "not found" });
-  }
+  let raw;
   try {
-    const dir = chunkDir(id);
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    const raw = Buffer.from(data, "base64");
-    if (raw.length > 512 * 1024) {
-      return res.status(413).json({ error: "chunk bytes too large" });
-    }
-    fs.writeFileSync(path.join(dir, String(index) + ".part"), raw);
-    res.json({ ok: true, index, bytes: raw.length });
-  } catch (e) {
-    res.status(500).json({ error: e.message || "chunk failed" });
+    raw = Buffer.from(data, "base64");
+  } catch {
+    return res.status(400).json({ error: "bad base64" });
   }
+  if (raw.length > 512 * 1024) {
+    return res.status(413).json({ error: "chunk bytes too large" });
+  }
+  // Serialize with finish/init so pending flag cannot race
+  withDb((db) => {
+    const row = db.items.find((x) => x && x.id === id && x.userKey === key);
+    if (!row) {
+      const err = new Error("not found");
+      err.status = 404;
+      throw err;
+    }
+    if (row.pending !== true) {
+      const err = new Error("upload not pending");
+      err.status = 409;
+      throw err;
+    }
+    const dir = chunkDir(id, key);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, String(index) + ".part"), raw);
+    return { ok: true, index, bytes: raw.length };
+  })
+    .then((out) => res.json(out))
+    .catch((e) =>
+      res.status(e.status || 500).json({ error: e.message || "chunk failed" })
+    );
 });
 
 app.post("/api/items/:id/finish", (req, res) => {
@@ -551,7 +683,17 @@ app.post("/api/items/:id/finish", (req, res) => {
       err.status = 404;
       throw err;
     }
-    const dir = chunkDir(id);
+    if (row.pending !== true) {
+      const err = new Error("upload not pending");
+      err.status = 409;
+      throw err;
+    }
+    const dir = chunkDir(id, key);
+    if (!fs.existsSync(dir)) {
+      const err = new Error("no chunks uploaded");
+      err.status = 400;
+      throw err;
+    }
     const ivB64 = fs.existsSync(path.join(dir, "iv"))
       ? fs.readFileSync(path.join(dir, "iv"), "utf8")
       : row.iv;
@@ -594,12 +736,13 @@ app.post("/api/items/:id/finish", (req, res) => {
       bufs.push(part);
     }
     const packed = Buffer.concat(bufs);
-    writeBlob(id, packed);
+    writeBlob(id, packed, key);
     row.pending = false;
     row.chunked = packed.length - ivBuf.length > INLINE_CT;
     row.totalChunks = parts.length;
     row.byteSize = Math.max(0, packed.length - ivBuf.length);
     row.iv = ivB64;
+    row.ivLen = ivBuf.length;
     try {
       fs.rmSync(dir, { recursive: true, force: true });
     } catch {}
@@ -655,10 +798,19 @@ app.get("/api/items/:id/chunk/:n", (req, res) => {
   const db = load();
   const row = db.items.find((x) => x && x.id === id && x.userKey === key);
   if (!row) return res.status(404).json({ error: "not found" });
-  let packed = readBlob(id);
-  if (!packed && row.ciphertext) packed = packedFromJson(row.iv, row.ciphertext);
+  let packed = readBlob(id, key);
+  if (!packed && row.ciphertext) {
+    try {
+      packed = packedFromJson(row.iv, row.ciphertext);
+    } catch {
+      packed = null;
+    }
+  }
   if (!packed || packed.length < 13) return res.status(404).json({ error: "no blob" });
-  const ct = packed.subarray(12); // IV=12
+  let ivLen = Number(row.ivLen) || 12;
+  if (ivLen < 8 || ivLen > 32) ivLen = 12;
+  if (packed.length <= ivLen) ivLen = 12;
+  const ct = packed.subarray(ivLen);
   const start = n * (256 * 1024);
   if (start >= ct.length) return res.status(404).json({ error: "no chunk" });
   const slice = ct.subarray(start, start + 256 * 1024);
@@ -673,17 +825,26 @@ app.get("/api/items/:id", (req, res) => {
   const db = load();
   const row = db.items.find((x) => x && x.id === id && x.userKey === key);
   if (!row) return res.status(404).json({ error: "not found" });
-  let packed = readBlob(id);
-  if (!packed && row.ciphertext) packed = packedFromJson(row.iv, row.ciphertext);
+  let packed = readBlob(id, key);
+  if (!packed && row.ciphertext) {
+    try {
+      packed = packedFromJson(row.iv, row.ciphertext);
+    } catch {
+      packed = null;
+    }
+  }
   const out = { ...row };
   delete out.ciphertext;
   delete out.userKey;
   if (packed && packed.length >= 13) {
-    // AES-GCM IV is 12 bytes in our clients
-    const ivLen = 12;
+    // Prefer stored ivLen; default 12 (AES-GCM / ChaCha20-Poly1305 nonce)
+    let ivLen = Number(row.ivLen) || 12;
+    if (ivLen < 8 || ivLen > 32) ivLen = 12;
+    if (packed.length <= ivLen) ivLen = 12;
     const iv = Buffer.from(packed.subarray(0, ivLen)).toString("base64");
     const ct = packed.subarray(ivLen);
     out.iv = iv;
+    out.ivLen = ivLen;
     out.byteSize = ct.length;
     if (ct.length <= INLINE_CT) {
       out.ciphertext = Buffer.from(ct).toString("base64");
@@ -711,7 +872,7 @@ app.delete("/api/devices/:id", (req, res) => {
     let removed = 0;
     for (const row of db.items) {
       if (row && row.userKey === key && row.deviceId === id) {
-        deleteBlob(row.id);
+        deleteBlob(row.id, key);
         removed++;
       } else if (row) {
         kept.push(row);
@@ -746,7 +907,7 @@ app.delete("/api/items/:id", (req, res) => {
       err.status = 403;
       throw err;
     }
-    deleteBlob(id);
+    deleteBlob(id, key);
     db.items = db.items.filter((x) => x && x.id !== id);
     return { ok: true, removed: 1 };
   })
@@ -763,7 +924,14 @@ app.use((err, _req, res, _next) => {
 });
 
 const port = Number(process.env.PORT) || 3000;
-app.listen(port, "0.0.0.0", () => {
+const server = app.listen(port, "0.0.0.0", () => {
   console.log("Natural Beauty backend v3 on :" + port);
   console.log("DATA_DIR=" + DATA_DIR + " MAX_ITEMS=" + MAX_ITEMS);
+});
+server.on("error", (err) => {
+  console.error("listen error", err && err.message);
+  process.exit(1);
+});
+process.on("unhandledRejection", (err) => {
+  console.error("unhandledRejection", err && (err.message || err));
 });
