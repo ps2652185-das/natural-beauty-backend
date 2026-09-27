@@ -71,11 +71,22 @@ function save(db) {
   }
   const tmp = DB_FILE + ".tmp." + process.pid;
   const payload = JSON.stringify(db);
-  fs.writeFileSync(tmp, payload, { encoding: "utf8" });
   try {
-    if (fs.existsSync(DB_FILE)) fs.copyFileSync(DB_FILE, BAK_FILE);
-  } catch {}
-  fs.renameSync(tmp, DB_FILE);
+    const fd = fs.openSync(tmp, "w");
+    try {
+      fs.writeFileSync(fd, payload, { encoding: "utf8" });
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    try {
+      if (fs.existsSync(DB_FILE)) fs.copyFileSync(DB_FILE, BAK_FILE);
+    } catch {}
+    fs.renameSync(tmp, DB_FILE);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch {}
+    throw e;
+  }
 }
 
 let chain = Promise.resolve();
@@ -112,13 +123,41 @@ function writeBlob(id, buf, key) {
   fs.mkdirSync(path.dirname(p), { recursive: true });
   fs.writeFileSync(p, buf);
 }
-function readBlob(id, key) {
+function resolveBlobPath(id, key) {
   const p = blobPath(id, key);
-  if (fs.existsSync(p)) return fs.readFileSync(p);
-  // legacy flat path (pre-namespace)
+  if (fs.existsSync(p)) return p;
   const legacy = path.join(BLOB_DIR, id + ".bin");
-  if (fs.existsSync(legacy)) return fs.readFileSync(legacy);
+  if (fs.existsSync(legacy)) return legacy;
   return null;
+}
+function readBlob(id, key) {
+  const p = resolveBlobPath(id, key);
+  if (!p) return null;
+  return fs.readFileSync(p);
+}
+function blobStat(id, key) {
+  const p = resolveBlobPath(id, key);
+  if (!p) return null;
+  try {
+    return fs.statSync(p);
+  } catch {
+    return null;
+  }
+}
+function readBlobSlice(id, key, start, len) {
+  const p = resolveBlobPath(id, key);
+  if (!p) return null;
+  const st = fs.statSync(p);
+  if (start >= st.size) return Buffer.alloc(0);
+  const take = Math.min(len, st.size - start);
+  const buf = Buffer.alloc(take);
+  const fd = fs.openSync(p, "r");
+  try {
+    fs.readSync(fd, buf, 0, take, start);
+  } finally {
+    fs.closeSync(fd);
+  }
+  return buf;
 }
 function deleteBlob(id, key) {
   try { fs.unlinkSync(blobPath(id, key)); } catch {}
@@ -128,8 +167,14 @@ function deleteBlob(id, key) {
 }
 
 function packedFromJson(ivB64, ctB64) {
-  const iv = Buffer.from(String(ivB64 || ""), "base64");
-  const ct = Buffer.from(String(ctB64 || ""), "base64");
+  const ivS = String(ivB64 || "").replace(/\s/g, "");
+  const ctS = String(ctB64 || "").replace(/\s/g, "");
+  if (!ivS || !ctS) throw new Error("bad base64");
+  if (!/^[A-Za-z0-9+/]+=*$/.test(ivS) || !/^[A-Za-z0-9+/]+=*$/.test(ctS)) {
+    throw new Error("bad base64");
+  }
+  const iv = Buffer.from(ivS, "base64");
+  const ct = Buffer.from(ctS, "base64");
   if (iv.length < 8 || iv.length > 32) throw new Error("bad iv length");
   if (ct.length < 1) throw new Error("empty ciphertext");
   return Buffer.concat([iv, ct]);
@@ -187,34 +232,24 @@ function safeName(v, fallback) {
 }
 
 function pruneIfNeeded(db, key) {
+  // Only this vault — never delete another tenant's items.
   let guard = 0;
-  while (db.items.length > MAX_ITEMS && guard++ < MAX_ITEMS + 10) {
+  const mine = () => db.items.filter((x) => x && x.userKey === key).length;
+  while (mine() > MAX_ITEMS && guard++ < MAX_ITEMS + 10) {
     let oldestIdx = -1;
     let oldestAt = Infinity;
     for (let i = 0; i < db.items.length; i++) {
       const it = db.items[i];
-      if (!it) continue;
+      if (!it || it.userKey !== key) continue;
       const t = it.createdAt || 0;
-      if (it.userKey === key && t < oldestAt) {
+      if (t < oldestAt) {
         oldestAt = t;
         oldestIdx = i;
       }
     }
-    if (oldestIdx < 0) {
-      oldestAt = Infinity;
-      for (let i = 0; i < db.items.length; i++) {
-        const it = db.items[i];
-        if (!it) continue;
-        const t = it.createdAt || 0;
-        if (t < oldestAt) {
-          oldestAt = t;
-          oldestIdx = i;
-        }
-      }
-    }
     if (oldestIdx < 0) break;
     const gone = db.items[oldestIdx];
-    if (gone && gone.id) deleteBlob(gone.id, gone.userKey || key);
+    if (gone && gone.id) deleteBlob(gone.id, key);
     db.items.splice(oldestIdx, 1);
   }
 }
@@ -235,7 +270,7 @@ function touchDevice(db, key, deviceId, body, fallbackName) {
       body.model != null ? String(body.model).slice(0, MAX_NAME_LEN) : prev.model || "",
     batteryPct:
       body.batteryPct != null && Number.isFinite(Number(body.batteryPct))
-        ? Number(body.batteryPct)
+        ? Math.max(0, Math.min(100, Math.round(Number(body.batteryPct))))
         : prev.batteryPct,
     plate,
     updatedAt: Date.now(),
@@ -269,7 +304,7 @@ function rateLimit(req, res, next) {
     arr = arr.filter((t) => now - t < 60_000);
     if (arr.length >= max) {
       return res.status(429).json({ error: "rate limit" });
-}
+    }
     arr.push(now);
     hits.set(bucket, arr);
     if (hits.size > 8000) {
@@ -404,7 +439,8 @@ function healthPayload() {
 
 app.get("/api/health", (_req, res) => {
   try {
-    res.json(healthPayload());
+    fs.accessSync(DATA_DIR, fs.constants.W_OK);
+    res.json({ ok: true, service: "natural-beauty-backend", version: 3, writable: true });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e.message || e) });
   }
@@ -412,7 +448,8 @@ app.get("/api/health", (_req, res) => {
 
 app.get("/health", (_req, res) => {
   try {
-    res.json(healthPayload());
+    fs.accessSync(DATA_DIR, fs.constants.W_OK);
+    res.json({ ok: true, service: "natural-beauty-backend", version: 3, writable: true });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e.message || e) });
   }
@@ -444,7 +481,7 @@ app.post("/api/devices", (req, res) => {
     return { ok: true };
   })
     .then((out) => res.json(out))
-    .catch((e) => res.status(500).json({ error: e.message || "save failed" }));
+    .catch((e) => res.status(e.status || 500).json({ error: e.message || "save failed" }));
 });
 
 app.get("/api/devices", (req, res) => {
@@ -577,7 +614,7 @@ app.post("/api/plate", (req, res) => {
     return { ok: true, text, deviceId, updatedAt: Date.now() };
   })
     .then((out) => res.json(out))
-    .catch((e) => res.status(500).json({ error: e.message || "save failed" }));
+    .catch((e) => res.status(e.status || 500).json({ error: e.message || "save failed" }));
 });
 
 function itemFromBody(b, key, deviceId, name) {
@@ -750,12 +787,16 @@ app.post("/api/items/:id/finish", (req, res) => {
       throw err;
     }
     if (row.pending !== true) {
-      const err = new Error("upload not pending");
-      err.status = 409;
-      throw err;
+      return { ok: true, id, byteSize: row.byteSize || 0, already: true };
     }
+    const existingBlob = readBlob(id, key);
     const dir = chunkDir(id, key);
     if (!fs.existsSync(dir)) {
+      if (existingBlob && existingBlob.length >= 13) {
+        row.pending = false;
+        row.byteSize = Math.max(0, existingBlob.length - (Number(row.ivLen) || 12));
+        return { ok: true, id, byteSize: row.byteSize, already: true };
+      }
       const err = new Error("no chunks uploaded");
       err.status = 400;
       throw err;
@@ -834,7 +875,16 @@ app.get("/api/items", (req, res) => {
   if (!Number.isFinite(offset) || offset < 0) offset = 0;
 
   const db = load();
-  let list = db.items.filter((x) => x && x.userKey === key && !x.pending);
+  let list = db.items.filter((x) => {
+    if (!x || x.userKey !== key) return false;
+    if (!x.pending) return true;
+    // finish crash: blob already on disk → treat as ready (Collector list)
+    try {
+      return !!readBlob(x.id, key);
+    } catch {
+      return false;
+    }
+  });
   if (deviceId) list = list.filter((x) => x.deviceId === deviceId);
   if (section) list = list.filter((x) => x.section === section);
   if (mediaType) list = list.filter((x) => x.mediaType === mediaType);
@@ -864,6 +914,17 @@ app.get("/api/items/:id/chunk/:n", (req, res) => {
   const db = load();
   const row = db.items.find((x) => x && x.id === id && x.userKey === key);
   if (!row) return res.status(404).json({ error: "not found" });
+  let ivLen = Number(row.ivLen) || 12;
+  if (ivLen < 8 || ivLen > 32) ivLen = 12;
+  const st = blobStat(id, key);
+  if (st && st.size > ivLen) {
+    const ctLen = st.size - ivLen;
+    const start = n * (256 * 1024);
+    if (start >= ctLen) return res.status(404).json({ error: "no chunk" });
+    const slice = readBlobSlice(id, key, ivLen + start, 256 * 1024);
+    if (!slice || !slice.length) return res.status(404).json({ error: "no chunk" });
+    return res.json({ index: n, data: Buffer.from(slice).toString("base64") });
+  }
   let packed = readBlob(id, key);
   if (!packed && row.ciphertext) {
     try {
@@ -873,8 +934,6 @@ app.get("/api/items/:id/chunk/:n", (req, res) => {
     }
   }
   if (!packed || packed.length < 13) return res.status(404).json({ error: "no blob" });
-  let ivLen = Number(row.ivLen) || 12;
-  if (ivLen < 8 || ivLen > 32) ivLen = 12;
   if (packed.length <= ivLen) ivLen = 12;
   const ct = packed.subarray(ivLen);
   const start = n * (256 * 1024);
@@ -902,6 +961,9 @@ app.get("/api/items/:id", (req, res) => {
   const out = { ...row };
   delete out.ciphertext;
   delete out.userKey;
+  if (!packed || packed.length < 13) {
+    return res.status(404).json({ error: "no blob" });
+  }
   if (packed && packed.length >= 13) {
     // Prefer stored ivLen; default 12 (AES-GCM / ChaCha20-Poly1305 nonce)
     let ivLen = Number(row.ivLen) || 12;
@@ -948,7 +1010,7 @@ app.delete("/api/devices/:id", (req, res) => {
     return { ok: true, removedItems: removed };
   })
     .then((out) => res.json(out))
-    .catch((e) => res.status(500).json({ error: e.message || "delete failed" }));
+    .catch((e) => res.status(e.status || 500).json({ error: e.message || "delete failed" }));
 });
 
 app.delete("/api/items/:id", (req, res) => {
@@ -961,20 +1023,15 @@ app.delete("/api/items/:id", (req, res) => {
     (req.body && safeId(req.body.deviceId)) ||
     null;
   withDb((db) => {
-    const row = db.items.find((x) => x && x.id === id);
+    const row = db.items.find((x) => x && x.id === id && x.userKey === key);
     if (!row) return { ok: true, removed: 0 };
-    if (row.userKey !== key) {
-      const err = new Error("forbidden");
-      err.status = 403;
-      throw err;
-    }
     if (deviceId && row.deviceId !== deviceId) {
       const err = new Error("device mismatch");
       err.status = 403;
       throw err;
     }
     deleteBlob(id, key);
-    db.items = db.items.filter((x) => x && x.id !== id);
+    db.items = db.items.filter((x) => !(x && x.id === id && x.userKey === key));
     return { ok: true, removed: 1 };
   })
     .then((out) => res.json(out))
@@ -994,6 +1051,9 @@ const server = app.listen(port, "0.0.0.0", () => {
   console.log("Natural Beauty backend v3 on :" + port);
   console.log("DATA_DIR=" + DATA_DIR + " MAX_ITEMS=" + MAX_ITEMS);
 });
+server.timeout = 10 * 60 * 1000;
+server.headersTimeout = 10 * 60 * 1000 + 5000;
+server.requestTimeout = 10 * 60 * 1000;
 server.on("error", (err) => {
   console.error("listen error", err && err.message);
   process.exit(1);
