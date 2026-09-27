@@ -28,7 +28,7 @@ function emptyDb() {
     items: [],
     locks: {},
     plates: {},
-    meta: { createdAt: Date.now(), version: 3 },
+    meta: { createdAt: Date.now(), version: 4 },
   };
 }
 
@@ -352,7 +352,7 @@ app.use((err, _req, res, next) => {
 });
 
 app.get("/", (_req, res) => {
-  res.json({ ok: true, service: "natural-beauty-backend", version: 3 });
+  res.json({ ok: true, service: "natural-beauty-backend", version: 4 });
 });
 
 function gcPending(db) {
@@ -428,7 +428,7 @@ function healthPayload() {
   return {
     ok: true,
     service: "natural-beauty-backend",
-    version: 3,
+    version: 4,
     writable: true,
     items: db.items.length,
     maxItems: MAX_ITEMS,
@@ -440,7 +440,7 @@ function healthPayload() {
 app.get("/api/health", (_req, res) => {
   try {
     fs.accessSync(DATA_DIR, fs.constants.W_OK);
-    res.json({ ok: true, service: "natural-beauty-backend", version: 3, writable: true });
+    res.json({ ok: true, service: "natural-beauty-backend", version: 4, writable: true });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e.message || e) });
   }
@@ -449,7 +449,7 @@ app.get("/api/health", (_req, res) => {
 app.get("/health", (_req, res) => {
   try {
     fs.accessSync(DATA_DIR, fs.constants.W_OK);
-    res.json({ ok: true, service: "natural-beauty-backend", version: 3, writable: true });
+    res.json({ ok: true, service: "natural-beauty-backend", version: 4, writable: true });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e.message || e) });
   }
@@ -750,28 +750,15 @@ app.post("/api/items/:id/chunk", (req, res) => {
   if (raw.length > 512 * 1024) {
     return res.status(413).json({ error: "chunk bytes too large" });
   }
-  // Serialize with finish/init so pending flag cannot race
-  withDb((db) => {
-    const row = db.items.find((x) => x && x.id === id && x.userKey === key);
-    if (!row) {
-      const err = new Error("not found");
-      err.status = 404;
-      throw err;
-    }
-    if (row.pending !== true) {
-      const err = new Error("upload not pending");
-      err.status = 409;
-      throw err;
-    }
+  // Fast path: do NOT rewrite store.json on every chunk (was causing timeouts).
+  try {
     const dir = chunkDir(id, key);
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, String(index) + ".part"), raw);
-    return { ok: true, index, bytes: raw.length };
-  })
-    .then((out) => res.json(out))
-    .catch((e) =>
-      res.status(e.status || 500).json({ error: e.message || "chunk failed" })
-    );
+    return res.json({ ok: true, index, bytes: raw.length });
+  } catch (e) {
+    return res.status(500).json({ error: e.message || "chunk failed" });
+  }
 });
 
 app.post("/api/items/:id/finish", (req, res) => {
@@ -1044,6 +1031,14 @@ app.use((err, _req, res, _next) => {
   console.error(err);
   if (res.headersSent) return;
   res.status(500).json({ error: "server error" });
+});
+
+
+process.on("uncaughtException", (err) => {
+  console.error("uncaught", err && err.stack ? err.stack : err);
+});
+process.on("unhandledRejection", (err) => {
+  console.error("unhandledRejection", err && err.stack ? err.stack : err);
 });
 
 const port = Number(process.env.PORT) || 3000;
